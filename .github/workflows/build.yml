@@ -1,56 +1,252 @@
-name: Build SmartWebDAV Exe
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+import threading
+import requests
+from flask import Flask, request, Response, stream_with_context
+import logging
+import json
+import os
+import sys
+import pystray
+from PIL import Image, ImageDraw
 
-on:
-  push:
-    branches: [ "main", "master" ]
-  workflow_dispatch:
+# ================= 配置区域 =================
 
-jobs:
-  build:
-    runs-on: windows-latest
+CONFIG_FILE = 'webdav_config.json'
+DEFAULT_CONFIG = {
+    "tailscale_url": "http://192.168.100.10:5000",
+    "cloudflare_url": "https://nas.example.com",
+    "local_port": 6688,
+    "auto_start": False
+}
 
-    steps:
-    - uses: actions/checkout@v4
+class AppState:
+    def __init__(self):
+        self.running = False
+        self.config = DEFAULT_CONFIG.copy()
+        self.server_thread = None
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+app_state = AppState()
+flask_app = Flask(__name__)
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
-    - name: Debug - List Files
-      run: |
-        echo "=== 当前仓库文件列表 ==="
-        Get-ChildItem -Recurse | Select-Object FullName
-        echo "========================"
+READ_METHODS = ['GET', 'HEAD', 'OPTIONS', 'PROPFIND']
+HOP_BY_HOP_HEADERS = [
+    'connection', 'keep-alive', 'proxy-authenticate', 
+    'proxy-authorization', 'te', 'trailers', 
+    'transfer-encoding', 'upgrade'
+]
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        # 尝试安装 requirements.txt，如果文件不存在则手动安装核心库，防止报错
-        if (Test-Path requirements.txt) {
-            pip install -r requirements.txt
-        } else {
-            echo "Warning: requirements.txt not found. Installing manually."
-            pip install flask requests pystray pillow pyinstaller
-        }
+def log_message(message):
+    if gui_instance:
+        gui_instance.append_log(message)
+    else:
+        print(message)
 
-    - name: Build with PyInstaller
-      run: |
-        # 自动查找第一个 .py 文件进行打包
-        $pyFile = Get-ChildItem -Filter *.py | Select-Object -First 1
-        
-        if ($null -eq $pyFile) {
-            Write-Error "❌ 严重错误: 没找到任何 .py 文件！请检查你是否上传了代码，或者文件后缀是不是 .py"
-            exit 1
-        }
-        
-        Write-Host "✅ 找到 Python 文件: $($pyFile.Name) - 开始打包..."
-        
-        # 开始打包
-        pyinstaller --noconsole --onefile --hidden-import=pystray --name="SmartWebDAV" $pyFile.Name
+def get_target_url(method, path):
+    conf = app_state.config
+    if method.upper() in READ_METHODS:
+        base = conf.get("tailscale_url", "").rstrip('/')
+        route_type = "READ (Tailscale)"
+    else:
+        base = conf.get("cloudflare_url", "").rstrip('/')
+        route_type = "WRITE (Cloudflare)"
+    
+    target = f"{base}/{path}"
+    if request.query_string:
+        target = f"{target}?{request.query_string.decode('utf-8')}"
+    return target, route_type
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: SmartWebDAV-Windows-Exe
-        path: dist/SmartWebDAV.exe
+def clean_headers(headers):
+    cleaned = {}
+    for key, value in headers.items():
+        if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() != 'host':
+            cleaned[key] = value
+    return cleaned
+
+@flask_app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PROPFIND', 'MKCOL', 'MOVE', 'COPY', 'LOCK', 'UNLOCK', 'PROPPATCH'])
+@flask_app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PROPFIND', 'MKCOL', 'MOVE', 'COPY', 'LOCK', 'UNLOCK', 'PROPPATCH'])
+def proxy(path):
+    method = request.method
+    target_url, route_type = get_target_url(method, path)
+    incoming_headers = clean_headers(request.headers)
+    
+    # 强制增加 User-Agent，防止 NAS 拒绝
+    if 'User-Agent' not in incoming_headers:
+        incoming_headers['User-Agent'] = 'SmartWebDAV/Debug'
+
+    # 日志：记录请求去向
+    # log_message(f"--> [{method}] {route_type}: /{path}")
+
+    try:
+        # 增加 verify=False 以忽略 SSL 证书错误 (解决 HTTPS 问题)
+        resp = requests.request(
+            method=method,
+            url=target_url,
+            headers=incoming_headers,
+            data=request.stream,
+            cookies=request.cookies,
+            allow_redirects=False,
+            stream=True,
+            verify=False 
+        )
+
+        # 核心修改：打印 NAS 返回的状态码
+        status_code = resp.status_code
+        if status_code >= 400:
+            log_message(f"❌ [{status_code}] {method} /{path} (Fail)")
+        else:
+            log_message(f"✅ [{status_code}] {method} /{path} (OK)")
+
+        excluded_headers = HOP_BY_HOP_HEADERS + ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+        headers = [
+            (name, value) for (name, value) in resp.headers.items()
+            if name.lower() not in excluded_headers
+        ]
+
+        return Response(
+            stream_with_context(resp.iter_content(chunk_size=4096)),
+            status=status_code,
+            headers=headers
+        )
+
+    except Exception as e:
+        log_message(f"🚨 严重错误: {str(e)}")
+        return Response(f"Proxy Error: {str(e)}", status=502)
+
+def run_flask():
+    try:
+        # 屏蔽 SSL 警告
+        requests.packages.urllib3.disable_warnings()
+        port = int(app_state.config.get("local_port", 6688))
+        log_message(f"服务启动中... 监听端口: {port}")
+        flask_app.run(host='127.0.0.1', port=port, threaded=True, use_reloader=False)
+    except Exception as e:
+        log_message(f"启动失败: {e}")
+
+class SmartGatewayGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("智能 WebDAV 网关 (调试版)")
+        self.root.geometry("500x550")
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
+        self.load_config()
+        self.create_widgets()
+        self.tray_icon = None
+        self.setup_tray()
+        if self.config.get("auto_start", False):
+            self.toggle_server()
+
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    self.config = json.load(f)
+            except:
+                self.config = DEFAULT_CONFIG.copy()
+        else:
+            self.config = DEFAULT_CONFIG.copy()
+        app_state.config = self.config
+
+    def save_config(self):
+        self.config["tailscale_url"] = self.ts_url_var.get()
+        self.config["cloudflare_url"] = self.cf_url_var.get()
+        self.config["local_port"] = self.port_var.get()
+        self.config["auto_start"] = self.auto_start_var.get()
+        app_state.config = self.config
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(self.config, f, indent=4)
+            messagebox.showinfo("成功", "配置已保存")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {e}")
+
+    def create_widgets(self):
+        style = ttk.Style()
+        style.configure("TLabel", font=("Microsoft YaHei UI", 9))
+        main_frame = ttk.Frame(self.root, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(main_frame, text="智能双路 WebDAV (调试版)", font=("Microsoft YaHei UI", 14, "bold")).pack(pady=(0, 20))
+        form_frame = ttk.LabelFrame(main_frame, text="路由配置", padding="10")
+        form_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(form_frame, text="下载线路 (Tailscale URL):").pack(anchor=tk.W)
+        self.ts_url_var = tk.StringVar(value=self.config.get("tailscale_url"))
+        ttk.Entry(form_frame, textvariable=self.ts_url_var).pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(form_frame, text="上传线路 (Cloudflare URL):").pack(anchor=tk.W)
+        self.cf_url_var = tk.StringVar(value=self.config.get("cloudflare_url"))
+        ttk.Entry(form_frame, textvariable=self.cf_url_var).pack(fill=tk.X, pady=(0, 10))
+        port_frame = ttk.Frame(form_frame)
+        port_frame.pack(fill=tk.X)
+        ttk.Label(port_frame, text="端口:").pack(side=tk.LEFT)
+        self.port_var = tk.StringVar(value=self.config.get("local_port"))
+        ttk.Entry(port_frame, textvariable=self.port_var, width=10).pack(side=tk.LEFT, padx=5)
+        self.auto_start_var = tk.BooleanVar(value=self.config.get("auto_start", False))
+        ttk.Checkbutton(form_frame, text="自动启动", variable=self.auto_start_var).pack(side=tk.LEFT, padx=20)
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=15)
+        self.start_btn = ttk.Button(btn_frame, text="启动服务", command=self.toggle_server)
+        self.start_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(btn_frame, text="保存配置", command=self.save_config).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        log_frame = ttk.LabelFrame(main_frame, text="实时日志 (状态码)", padding="5")
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state='disabled', font=("Consolas", 9))
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def append_log(self, msg):
+        def _update():
+            self.log_text.configure(state='normal')
+            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.see(tk.END)
+            self.log_text.configure(state='disabled')
+        self.root.after(0, _update)
+
+    def toggle_server(self):
+        if app_state.running:
+            messagebox.showwarning("提示", "需重启程序以应用更改")
+            return
+        app_state.config["tailscale_url"] = self.ts_url_var.get()
+        app_state.config["cloudflare_url"] = self.cf_url_var.get()
+        app_state.config["local_port"] = self.port_var.get()
+        t = threading.Thread(target=run_flask, daemon=True)
+        t.start()
+        app_state.running = True
+        self.start_btn.config(text="运行中", state='disabled')
+        self.append_log(">>> 服务已启动")
+
+    def create_image(self):
+        w, h = 64, 64
+        image = Image.new('RGB', (w, h), (255, 69, 0)) # 变成橙色方便区分
+        dc = ImageDraw.Draw(image)
+        dc.rectangle((16, 16, 48, 48), fill='white')
+        return image
+
+    def setup_tray(self):
+        image = self.create_image()
+        menu = pystray.Menu(pystray.MenuItem("显示", self.show_window, default=True), pystray.MenuItem("退出", self.quit_app))
+        self.tray_icon = pystray.Icon("SmartGateway", image, "WebDAV Debug", menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def hide_window(self):
+        self.root.withdraw()
+    def show_window(self, icon, item):
+        self.root.after(0, self.root.deiconify)
+    def quit_app(self, icon, item):
+        self.tray_icon.stop()
+        self.root.quit()
+        sys.exit()
+
+if __name__ == '__main__':
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except:
+        pass
+    root = tk.Tk()
+    gui_instance = SmartGatewayGUI(root)
+    ws = root.winfo_screenwidth()
+    hs = root.winfo_screenheight()
+    x = (ws/2) - (500/2)
+    y = (hs/2) - (550/2)
+    root.geometry('+%d+%d' % (x, y))
+    root.mainloop()
