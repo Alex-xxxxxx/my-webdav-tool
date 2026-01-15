@@ -1,0 +1,5 @@
+flask
+requests
+pystray
+pillow
+pyinstaller
