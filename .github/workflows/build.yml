@@ -2,7 +2,7 @@ name: Build SmartWebDAV Exe
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
@@ -17,14 +17,37 @@ jobs:
       with:
         python-version: '3.10'
 
+    - name: Debug - List Files
+      run: |
+        echo "=== 当前仓库文件列表 ==="
+        Get-ChildItem -Recurse | Select-Object FullName
+        echo "========================"
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        # 尝试安装 requirements.txt，如果文件不存在则手动安装核心库，防止报错
+        if (Test-Path requirements.txt) {
+            pip install -r requirements.txt
+        } else {
+            echo "Warning: requirements.txt not found. Installing manually."
+            pip install flask requests pystray pillow pyinstaller
+        }
 
     - name: Build with PyInstaller
       run: |
-        pyinstaller --noconsole --onefile --name="SmartWebDAV" smart_webdav_gui.py
+        # 自动查找第一个 .py 文件进行打包
+        $pyFile = Get-ChildItem -Filter *.py | Select-Object -First 1
+        
+        if ($null -eq $pyFile) {
+            Write-Error "❌ 严重错误: 没找到任何 .py 文件！请检查你是否上传了代码，或者文件后缀是不是 .py"
+            exit 1
+        }
+        
+        Write-Host "✅ 找到 Python 文件: $($pyFile.Name) - 开始打包..."
+        
+        # 开始打包
+        pyinstaller --noconsole --onefile --hidden-import=pystray --name="SmartWebDAV" $pyFile.Name
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v3
